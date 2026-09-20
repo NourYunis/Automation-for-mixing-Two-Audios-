@@ -45,6 +45,12 @@ def main(page: ft.Page):
     url = ft.TextField(label="YouTube playlist link (optional - downloaded into the Recitations folder first)",
                        value=saved("url"), dense=True)
 
+    cookies = ft.Dropdown(label="Browser cookies (only if YouTube blocks the download)", value=saved("cookies", ""),
+                          width=380, dense=True,
+                          options=[ft.dropdown.Option("", "None"), ft.dropdown.Option("firefox", "Firefox"),
+                                   ft.dropdown.Option("edge", "Edge"), ft.dropdown.Option("chrome", "Chrome"),
+                                   ft.dropdown.Option("brave", "Brave")])
+
     # ---- options --------------------------------------------------------- #
     api = ft.TextField(label="Gemini API key", password=True, can_reveal_password=True, dense=True,
                        value=saved("api", os.environ.get("GEMINI_API_KEY", "")))
@@ -78,6 +84,12 @@ def main(page: ft.Page):
 
     # ---- run / log ------------------------------------------------------- #
     bar = ft.ProgressBar(value=0)
+    spinner = ft.ProgressRing(width=18, height=18, stroke_width=2, visible=False)
+    status = ft.Text("Idle", size=14, weight=ft.FontWeight.W_500, expand=True)
+
+    def set_status(msg):
+        status.value = msg
+        page.update()
     log = ft.ListView(height=340, spacing=1, auto_scroll=True)
     run_btn = ft.FilledButton("Build", icon=ft.Icons.PLAY_ARROW)
     dl_btn = ft.OutlinedButton("Download recitations only", icon=ft.Icons.DOWNLOAD)
@@ -114,6 +126,7 @@ def main(page: ft.Page):
         store.set("api", api.value)
         store.set("model", model.value)
         store.set("url", url.value)
+        store.set("cookies", cookies.value or "")
 
         lo, hi = int(surah_from.value), int(surah_to.value)
         if lo > hi:
@@ -122,17 +135,20 @@ def main(page: ft.Page):
         cfg = Settings(
             api_key=api.value.strip(), model=model.value.strip(),
             playlist_url=url.value.strip(), download_only=download_only,
+            cookies_browser=cookies.value or "",
             output_dir=Path(fields["output_dir"].value or "."),
             recitations_dir=Path(fields["recitations_dir"].value) if fields["recitations_dir"].value else None,
             final_dir=Path(fields["final_dir"].value or "final"),
             docx_dir=Path(fields["docx_dir"].value) if fields["docx_dir"].value else None,
             languages=chosen, surah_from=lo, surah_to=hi, basmala=basmala.value,
             overwrite=overwrite.value, relisten=relisten.value, dry_run=dry.value,
-            log=add, progress=progress, stop=stop_ev)
+            log=add, progress=progress, status=set_status, stop=stop_ev)
         log.controls.clear()
         bar.value = 0
         run_btn.disabled = dl_btn.disabled = True
         stop_btn.disabled = False
+        spinner.visible = True
+        status.value = "Starting..."
         page.update()
 
         def work():
@@ -140,8 +156,11 @@ def main(page: ft.Page):
                 run_batch(cfg)
             except Exception as e:
                 add(f"✗ ERROR: {e}")
+            if stop_ev.is_set():
+                status.value = "Stopped"
             run_btn.disabled = dl_btn.disabled = False
             stop_btn.disabled = True
+            spinner.visible = False
             page.update()
 
         threading.Thread(target=work, daemon=True).start()
@@ -149,7 +168,14 @@ def main(page: ft.Page):
     surah_from.on_change = surah_to.on_change = detect
     run_btn.on_click = lambda _: start(False)
     dl_btn.on_click = lambda _: start(True)
-    stop_btn.on_click = lambda _: stop_ev.set()
+    def stop(_):
+        stop_ev.set()
+        stop_btn.disabled = True
+        status.value = "⏹ Stopping - finishing the current step..."
+        add("⏹ Stop requested - it will stop as soon as the current step ends "
+            "(a running Gemini request or download has to finish first).")
+
+    stop_btn.on_click = stop
 
     page.add(
         ft.Text("Surah Audio Builder", size=24, weight=ft.FontWeight.BOLD),
@@ -157,12 +183,14 @@ def main(page: ft.Page):
                 color=ft.Colors.GREY_500),
         *rows,
         url,
+        cookies,
         ft.Row([api, model], vertical_alignment=ft.CrossAxisAlignment.START),
         ft.Row([ft.Text("Languages / dialects:"), ft.TextButton("Detect", icon=ft.Icons.REFRESH, on_click=detect)]),
         lang_row, lang_info,
         ft.Row([surah_from, surah_to, basmala], wrap=True),
         ft.Row([overwrite, relisten, dry], wrap=True),
         ft.Row([run_btn, dl_btn, stop_btn]),
+        ft.Row([spinner, status]),
         bar,
         ft.Container(log, border=ft.border.all(1, ft.Colors.GREY_700), border_radius=6, padding=8),
     )

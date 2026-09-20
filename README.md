@@ -1,4 +1,4 @@
-# Automation-for-mixing-Two-Audios-
+# Surah Audio Builder
 
 Builds a Quran audio book where every verse is followed by its spoken interpretation (tafsir):
 
@@ -86,7 +86,7 @@ A `.txt`, `.md`, `.srt`, `.vtt` or `.docx` in the surah folder, named with the s
 
 ### YouTube playlist download
 
-Every video is saved as mp3 (`<playlist number> - <title>.mp3`) in the Recitations folder. Videos already downloaded are recorded in `.downloaded.txt` and skipped next time. The surah is found from the surah name in the title. Files whose title has no recognisable surah name are listed in the log ("cannot tell which surah this is"); rename them, e.g. to `سورة النبأ.mp3`. If downloads suddenly fail, run `pip install -U yt-dlp`.
+Every video is saved as mp3 (`<playlist number> - <title>.mp3`) in the Recitations folder. Videos already downloaded are recorded in `.downloaded.txt` and skipped next time. The surah is found from the surah name in the title. Files whose title has no recognisable surah name are listed in the log ("cannot tell which surah this is"); rename them, e.g. to `سورة النبأ.mp3`. YouTube downloads need a JavaScript runtime: install [Deno](https://deno.com) (`winget install DenoLand.Deno`, or the PowerShell installer). The app finds it on your PATH or in `%USERPROFILE%\.deno\bin`, so it also works if the app was already open when you installed it. `yt-dlp[default]` (in `requirements.txt`) includes the solver component it needs. If downloads suddenly fail, run `pip install -U "yt-dlp[default]"`.
 
 ---
 
@@ -133,6 +133,7 @@ Less common settings (gaps between clips, output format and bitrate, maximum int
 |---|---|
 | `NEEDS REVIEW: you returned N entries…` | Gemini could not find the right number of verses. Check that the file really is this surah and that the surah folder name is right; try "Ask Gemini again" or a stronger model. |
 | `NEEDS REVIEW: verse 1 starts at …s` | Gemini merged verse 1 into the intro. Retry, or edit the `.map.json`. If your intro is genuinely longer than 25 s, raise `max_intro` in `Settings`. |
+| `unable to download video data: HTTP Error 403` | YouTube blocked that video for one client, often only temporarily. The app already retries failed videos through other YouTube clients. If some still fail: press the download button again later (finished videos are never re-downloaded), run `pip install -U --pre "yt-dlp[default]"`, or pick your browser in **Browser cookies**. |
 | `no recitation file found` | The recitation file name does not contain the surah name or number. Rename it or check the Recitations folder. |
 | `recitation: could not find N pauses` | Wrong recitation file for this surah, or the recording has too little silence between verses. |
 | `interpretation audio is too long (>18 MB)` | Very long recordings are sent in one request; split the audio. |

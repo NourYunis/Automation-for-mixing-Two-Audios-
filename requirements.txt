@@ -7,6 +7,6 @@ pydantic>=2
 pydub
 numpy
 python-docx
-yt-dlp
+yt-dlp[default]
 audioop-lts; python_version >= "3.13"
 # also install ffmpeg:  winget install Gyan.FFmpeg

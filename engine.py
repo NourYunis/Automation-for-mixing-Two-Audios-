@@ -15,6 +15,7 @@ import base64
 import io
 import re
 import threading
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -75,6 +76,7 @@ class Settings:
     final_dir: Path = Path("final")
     playlist_url: str = ""                   # YouTube playlist with the recitations (optional)
     download_only: bool = False
+    cookies_browser: str = ""               # chrome / edge / firefox / brave, only if YouTube blocks
     docx_dir: Path = None                    # optional: .docx tafsir used as reference text
     languages: tuple = ()                    # empty = every language found in the file names
     surah_from: int = 1                      # range of surahs to process (inclusive)
@@ -95,6 +97,7 @@ class Settings:
     dry_run: bool = False
     log: Callable = print
     progress: Callable = lambda done, total: None
+    status: Callable = lambda msg: None      # one-line 'what is the app doing right now'
     stop: threading.Event = field(default_factory=threading.Event)
 
 
@@ -176,6 +179,15 @@ def fmt_ms(ms) -> str:
 # --------------------------------------------------------------------------- #
 class SplitError(Exception):
     pass
+
+
+class Stopped(Exception):
+    """The user pressed Stop."""
+
+
+def check_stop(cfg):
+    if cfg.stop.is_set():
+        raise Stopped()
 
 
 def _frame_db(audio) -> np.ndarray:
@@ -342,8 +354,14 @@ def say(s, msg):
     s["cfg"].log(msg)
 
 
+def doing(s, msg):
+    s["cfg"].status(f"[{s['number']:03d} {s['name']} / {s['lang']}] {msg}")
+
+
 def prepare(s: State):
     cfg = s["cfg"]
+    check_stop(cfg)
+    doing(s, "loading and cutting the recitation...")
     rec = AudioSegment.from_file(str(s["rec_path"]))
     clips = split_recitation(rec, s["verses"], s["number"], cfg)
     say(s, f"   recitation: {len(clips)} verse clips")
@@ -353,6 +371,7 @@ def prepare(s: State):
 
 def listen(s: State):
     cfg, mp, attempt = s["cfg"], s["map_path"], s["attempt"]
+    check_stop(cfg)
     if attempt == 0 and mp.exists() and not cfg.relisten:
         try:
             tm = TafsirMap.model_validate_json(mp.read_text("utf-8"))
@@ -363,6 +382,7 @@ def listen(s: State):
     if not cfg.api_key:
         raise SplitError("no Gemini API key")
     say(s, f"   [{s['lang']}] Gemini is listening (try {attempt + 1})...")
+    doing(s, f"Gemini is listening to the audio (try {attempt + 1}) - this can take a minute...")
     text = f"Surah {s['name']}, {s['verses']} verses. Language or dialect of the recording: {s['lang']}."
     if s.get("reference"):
         text += ("\n\nReference text (the written version of what is spoken; it may also contain the "
@@ -384,6 +404,7 @@ def check(s: State):
     """The guard that replaces the old 'verse count exceeds' crash: the map is validated, and if
     it is wrong Gemini gets the exact complaint and tries again."""
     cfg, tm, n = s["cfg"], s.get("tmap"), s["verses"]
+    check_stop(cfg)
     total = len(s["tafsir"]) / 1000
     if tm is None:
         return {"error": "the answer was not valid JSON for the requested schema."}
@@ -418,6 +439,8 @@ def route(s: State):
 def assemble(s: State):
     cfg, a, spans, tm = s["cfg"], s["tafsir"], s["spans"], s["tmap"]
     total, lang = len(a), s["lang"]
+    check_stop(cfg)
+    doing(s, "cutting and merging the verses...")
     ms = [(int(x * 1000), int(y * 1000)) for x, y in spans]
     mids = silence_mids(a) if cfg.snap_window > 0 else []
     # start may only move EARLIER and end only LATER, so a word of verse 1 can never be cut off
@@ -446,6 +469,7 @@ def assemble(s: State):
         parts += [verse, pv, tafsir, pt]
     out = concat(parts, s["rec"])
     kw = {"bitrate": cfg.bitrate} if cfg.fmt == "mp3" else {}
+    doing(s, "saving the file...")
     out.export(str(s["out_path"]), format=cfg.fmt, **kw)
     say(s, f"   saved -> {s['out_path'].name}  ({fmt_ms(len(out))})")
     return {"output": str(s["out_path"])}
@@ -467,19 +491,54 @@ def build_graph():
 # YouTube playlist -> recitation files                                         #
 # --------------------------------------------------------------------------- #
 class _YtLog:
-    def __init__(self, log):
-        self.log = log
+    """Receives yt-dlp's own messages; keeps the useful ones (which item, skipped, errors)."""
+
+    def __init__(self, cfg, counts):
+        self.cfg, self.counts = cfg, counts
+
+    @staticmethod
+    def _clean(m):
+        return re.sub(r"\x1b\[[0-9;]*m", "", str(m))
 
     def debug(self, m):
-        pass
+        m = self._clean(m)
+        item = re.search(r"Downloading item (\d+) of (\d+)", m)
+        if item:
+            self.cfg.status(f"Item {item[1]} of {item[2]}: reading video info...")
+            self.cfg.log(f"\n▶ item {item[1]} of {item[2]}")
+        elif "already been recorded in the archive" in m:
+            self.counts["skipped"] += 1
+            self.cfg.log("   ↷ skipped - already downloaded before")
+        elif re.search(r"Downloading playlist|Extracting URL|Finished downloading playlist", m):
+            text = re.sub(r"^\[[^\]]+\]\s*", "", m)
+            self.cfg.log("   " + text)
 
     info = debug
 
     def warning(self, m):
-        self.log(f"   ! {m}")
+        self.cfg.log(f"   ! {self._clean(m)}")
 
     def error(self, m):
-        self.log(f"   ✗ {m}")
+        self.counts["failed"] += 1
+        self.cfg.log(f"   ✗ {self._clean(m)}")
+
+
+def _find_deno():
+    """Deno path: PATH first, then the folder the PowerShell installer uses. Looking in the
+    default folder too means it works even if this app was started before Deno was installed
+    (a running program does not see a PATH changed afterwards)."""
+    import os
+    import shutil
+    found = shutil.which("deno")
+    if found:
+        return found
+    for base in (os.environ.get("DENO_INSTALL"), str(Path.home() / ".deno")):
+        if base:
+            for name in ("deno.exe", "deno"):
+                cand = Path(base) / "bin" / name
+                if cand.is_file():
+                    return str(cand)
+    return None
 
 
 def download_recitations(cfg):
@@ -492,23 +551,118 @@ def download_recitations(cfg):
         raise SplitError("downloading needs yt-dlp:  pip install -U yt-dlp")
     dest = Path(cfg.recitations_dir)
     dest.mkdir(parents=True, exist_ok=True)
-    cfg.log(f"Downloading recitations into {dest} ...")
+    url = cfg.playlist_url.strip()
+    m = re.search(r"[?&]list=([\w-]+)", url)
+    if m and "/playlist?list=" not in url:          # watch?v=..&list=.. -> the plain playlist page
+        url = f"https://www.youtube.com/playlist?list={m.group(1)}"
+        cfg.log(f"   using the playlist page: {url}")
+    if m and m.group(1).startswith(("RD", "UL")):
+        cfg.log("   ! this looks like an auto-generated Mix, not a real playlist - YouTube often blocks these")
+    cfg.log(f"Downloading recitations into {dest} (yt-dlp {yt_dlp.version.__version__}) ...")
 
-    def hook(d):
-        if d.get("status") == "finished":
-            cfg.log(f"   downloaded: {Path(d['filename']).name}")
+    counts = {"skipped": 0, "failed": 0, "done": 0}
+
+    def stop_filter(info, *, incomplete=False):     # asked before every video: reject = stop the playlist
+        return "stopped by user" if cfg.stop.is_set() else None
+
+    seen = set()
+
+    def where(d):
+        info = d.get("info_dict") or {}
+        idx = info.get("playlist_index")
+        total = info.get("n_entries") or info.get("playlist_count")
+        return idx, total, (info.get("title") or "")[:70]
+
+    def hook(d):                                   # the download itself
+        if cfg.stop.is_set():
+            raise yt_dlp.utils.DownloadCancelled()
+        idx, total, title = where(d)
+        tag = f"{idx}/{total}" if idx and total else "?"
+        if d.get("status") == "downloading":
+            got, size = d.get("downloaded_bytes") or 0, d.get("total_bytes") or d.get("total_bytes_estimate")
+            pct = got / size * 100 if size else 0
+            if tag not in seen:
+                seen.add(tag)
+                cfg.log(f"   ⬇ downloading {tag}: {title}")
+            cfg.status(f"⬇ Downloading {tag}: {title} - {pct:.0f}%")
+            if idx and total:
+                cfg.progress(idx - 1 + pct / 100, total)
+        elif d.get("status") == "finished":
+            cfg.log(f"   ✔ downloaded {tag}: {title}")
+            cfg.status(f"🎧 Converting {tag} to mp3: {title}")
+
+    def pp_hook(d):                                # the mp3 conversion
+        if d.get("postprocessor") == "ExtractAudio" and d.get("status") == "finished":
+            counts["done"] += 1
+            idx, total, title = where(d)
+            cfg.log(f"   ✔ ready (mp3): {title}")
+            if idx and total:
+                cfg.progress(idx, total)
 
     opts = {"format": "bestaudio/best", "quiet": True, "no_warnings": True, "ignoreerrors": True,
             "outtmpl": str(dest / "%(playlist_index)s - %(title)s.%(ext)s"),
             "windowsfilenames": True, "download_archive": str(dest / ".downloaded.txt"),
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
                                 "preferredquality": "192"}],
-            "logger": _YtLog(cfg.log), "progress_hooks": [hook]}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([cfg.playlist_url.strip()])
+            "logger": _YtLog(cfg, counts), "progress_hooks": [hook],
+            "postprocessor_hooks": [pp_hook],
+            "match_filter": stop_filter, "break_on_reject": True,
+            "no_color": True, "remote_components": ["ejs:github"],
+            "retries": 10, "fragment_retries": 10, "extractor_retries": 3,
+            "sleep_interval": 1, "max_sleep_interval": 3}
+    if cfg.cookies_browser:
+        opts["cookiesfrombrowser"] = (cfg.cookies_browser,)
+    deno = _find_deno()
+    if deno:
+        opts["js_runtimes"] = {"deno": {"path": deno}}
+        cfg.log(f"   using Deno: {deno}")
+    else:
+        cfg.log("   ! Deno not found - install it (winget install DenoLand.Deno) and restart the app")
+    # YouTube answers "403 Forbidden" for some videos/clients, often only some of the time. A failed
+    # video is not recorded in the archive, so every extra pass re-tries ONLY the failed ones,
+    # each time through a different YouTube client.
+    passes = [None, {"player_client": ["tv"]}, {"player_client": ["web_safari"]},
+              {"player_client": ["mweb"]}]
+    cfg.status("Reading the playlist...")
+    skipped_first = 0
+    for n, clients in enumerate(passes, 1):
+        counts["failed"] = 0
+        seen.clear()
+        o = dict(opts)
+        if clients:
+            o["extractor_args"] = {"youtube": clients}
+        if n > 1:
+            cfg.log(f"\n--- pass {n}/{len(passes)}: retrying the failed videos through the "
+                    f"'{clients['player_client'][0]}' YouTube client")
+        try:
+            with yt_dlp.YoutubeDL(o) as ydl:
+                ydl.download([url])
+        except yt_dlp.utils.DownloadCancelled:
+            break
+        if cfg.stop.is_set():
+            break
+        if n == 1:
+            skipped_first = counts["skipped"]
+        counts["skipped"] = skipped_first
+        if not counts["failed"] or n == len(passes):
+            break
+        cfg.log(f"   {counts['failed']} video(s) failed (YouTube 403/blocked) - waiting a few seconds, then trying again")
+        cfg.status("Some videos were blocked - retrying with another YouTube client...")
+        cfg.stop.wait(5)                     # a wait that Stop can interrupt
+    cfg.status("Download stopped" if cfg.stop.is_set() else "Download finished")
+    cfg.log(f"\nDownload summary: {counts['done']} new, {counts['skipped']} already had, "
+            f"{counts['failed']} still failing")
+    if counts["failed"]:
+        cfg.log("   ! YouTube keeps blocking some videos. Try, in this order:  1) press the button again "
+                "later (the blocking is often temporary; finished videos are never downloaded twice)  "
+                "2) pip install -U --pre \"yt-dlp[default]\"  3) choose your browser in 'Browser cookies'")
     files = _files(dest, AUDIO_EXTS)
     unknown = [p.name for p in files if surah_of(p.stem) is None]
     cfg.log(f"Recitations folder now has {len(files)} audio file(s).")
+    if not files:
+        cfg.log("   ! nothing was downloaded. Try: 1) pip install -U --pre \"yt-dlp[default]\"  "
+                "2) make sure the playlist is Public or Unlisted (open the link in a private window)  "
+                "3) pick your browser in 'Browser cookies' below and try again")
     for n in unknown:
         cfg.log(f"   ! cannot tell which surah this is (no surah name in the title): {n}")
 
@@ -566,6 +720,10 @@ def run_batch(cfg: Settings):
             cfg.log(f"✗ download failed: {e}")
             if cfg.download_only:
                 return []
+    if cfg.stop.is_set():
+        cfg.status("Stopped")
+        cfg.log("⏹ stopped by you")
+        return []
     if cfg.download_only:
         return []
     Path(cfg.final_dir).mkdir(parents=True, exist_ok=True)
@@ -573,7 +731,7 @@ def run_batch(cfg: Settings):
     cfg.log(f"{len(jobs)} job(s) found")
     for i, (num, lang, folder, rec, audio) in enumerate(jobs, 1):
         if cfg.stop.is_set():
-            cfg.log("stopped")
+            cfg.log("⏹ stopped by you")
             break
         name, verses = SURAHS[num - 1]
         label = f"[{num:03d}] {name} / {lang}"
@@ -592,11 +750,17 @@ def run_batch(cfg: Settings):
                     "map_path": Path(str(base) + ".map.json"),
                     "reference": read_reference(find_reference(cfg, num, folder, lang))})
                 status = "ok" if st.get("output") else f"NEEDS REVIEW: {st.get('error')}"
+        except Stopped:
+            cfg.log("   ⏹ stopped by you")
+            results.append((label, "stopped"))
+            break
         except Exception as e:      # one bad file never stops the batch
             status = f"error: {e}"
         cfg.log(f"   -> {status}")
+        cfg.status(f"{label}: {status}")
         results.append((label, status))
         cfg.progress(i, len(jobs))
+    cfg.status("Finished")
     cfg.log("\n=========== SUMMARY ===========")
     for label, status in results:
         cfg.log(f"{label:<32} {status}")
