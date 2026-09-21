@@ -2,7 +2,12 @@ flet==0.28.3
 flet-desktop==0.28.3
 langgraph
 langchain-core
-langchain-google-genai
+# >=2.0 is needed: the engine asks for structured output with include_raw=True, which is what
+# makes Gemini's token usage visible. Older versions silently drop the usage metadata.
+langchain-google-genai>=2.0
+# gemini-3.5-transcribe is served by the Interactions API of the google-genai SDK itself: keep it current
+# (pip install -U google-genai). The engine checks for it and says so if it is too old.
+google-genai
 pydantic>=2
 pydub
 numpy
